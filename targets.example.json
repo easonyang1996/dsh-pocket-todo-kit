@@ -1,0 +1,11 @@
+[
+  {
+    "id": "wechat",
+    "name": "微信",
+    "kind": "android_app",
+    "packageName": "com.tencent.mm",
+    "aliases": ["WeChat"],
+    "source": "微信 Android 标准发行版；未来以设备扫描核对",
+    "origin": "builtin"
+  }
+]

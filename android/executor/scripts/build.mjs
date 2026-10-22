@@ -1,0 +1,46 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import {execFileSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const sdk=process.env.ANDROID_SDK_ROOT||path.join(os.homedir(),'Library/Android/sdk');
+const java=process.env.JAVA_HOME||'/usr/local/opt/openjdk@17';
+const bt=path.join(sdk,'build-tools/35.0.0'), platform=path.join(sdk,'platforms/android-34/android.jar');
+const build=path.join(root,'build'), out=path.join(root,'dist'), signing=path.join(root,'.signing');
+for(const p of [build,out,signing,path.join(root,'vendor/sdk')])fs.mkdirSync(p,{recursive:true});
+fs.chmodSync(signing,0o700);
+const run=(bin,args,env={})=>execFileSync(bin,args,{cwd:root,env:{...process.env,JAVA_HOME:java,...env},stdio:'pipe'}).toString();
+const j=(name)=>path.join(java,'bin',name);
+const aar=path.join(root,'vendor/wechat-sdk-android-6.8.40.aar');
+if(crypto.createHash('sha256').update(fs.readFileSync(aar)).digest('hex')!=='c3c3215f2bc7f6aad0454541f9bdd91878cdb15b64d35e194a6c9240000c5d48')throw Error('SDK checksum mismatch');
+run('python3',['-c','import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); z.extract("classes.jar",sys.argv[2])',aar,path.join(root,'vendor/sdk')]);
+const credsFile=path.join(signing,'credentials.json');
+if(!fs.existsSync(credsFile))fs.writeFileSync(credsFile,JSON.stringify({password:crypto.randomBytes(32).toString('hex')}),{mode:0o600});
+const env={POCKET_KEY_PASSWORD:JSON.parse(fs.readFileSync(credsFile)).password};
+const ks=path.join(signing,'executor.jks');
+if(!fs.existsSync(ks))run(j('keytool'),['-genkeypair','-keystore',ks,'-alias','executor','-storepass:env','POCKET_KEY_PASSWORD','-keypass:env','POCKET_KEY_PASSWORD','-keyalg','RSA','-keysize','2048','-validity','10000','-dname','CN=Pocket Executor Test, O=PersonalAI, C=CN'],env);
+const walk=(dir)=>fs.readdirSync(dir,{withFileTypes:true}).flatMap(d=>d.isDirectory()?walk(path.join(dir,d.name)):[path.join(dir,d.name)]);
+function compile(name,manifest,sourceDir,resources,extraClasspath=[]){
+ const base=path.join(build,name);fs.rmSync(base,{recursive:true,force:true});for(const p of ['classes','dex','generated'])fs.mkdirSync(path.join(base,p),{recursive:true});
+ const resourceApk=path.join(base,'resources.apk');const args=['link','-o',resourceApk,'--manifest',manifest,'-I',platform,'--java',path.join(base,'generated')];
+ if(resources){const zip=path.join(base,'resources.zip');run(path.join(bt,'aapt2'),['compile','--dir',resources,'-o',zip]);args.push(zip);}
+ run(path.join(bt,'aapt2'),args);
+ const sources=[...walk(sourceDir),...walk(path.join(base,'generated'))].filter(p=>p.endsWith('.java'));
+ run(j('javac'),['--release','8','-encoding','UTF-8','-classpath',[platform,path.join(root,'vendor/sdk/classes.jar'),...extraClasspath].join(path.delimiter),'-d',path.join(base,'classes'),...sources]);
+ const jar=path.join(base,'classes.jar');run(j('jar'),['cf',jar,'-C',path.join(base,'classes'),'.']);
+ run(j('java'),['-cp',path.join(bt,'lib/d8.jar'),'com.android.tools.r8.D8','--min-api','26','--lib',platform,...extraClasspath.flatMap(p=>['--classpath',p]),'--output',path.join(base,'dex'),jar,...(name==='executor'?[path.join(root,'vendor/sdk/classes.jar')]:[])]);
+ const raw=path.join(base,'unsigned.apk');fs.copyFileSync(resourceApk,raw);
+ run('python3',['-c','import zipfile,sys,pathlib; z=zipfile.ZipFile(sys.argv[1],"a"); [z.write(p,p.name,compress_type=zipfile.ZIP_STORED) for p in pathlib.Path(sys.argv[2]).glob("*.dex")]; z.close()',raw,path.join(base,'dex')]);
+ const aligned=path.join(base,'aligned.apk');run(path.join(bt,'zipalign'),['-f','-p','4',raw,aligned]);
+ const apk=path.join(out,name+'.apk');run(j('java'),['-jar',path.join(bt,'lib/apksigner.jar'),'sign','--ks',ks,'--ks-key-alias','executor','--ks-pass','env:POCKET_KEY_PASSWORD','--key-pass','env:POCKET_KEY_PASSWORD','--out',apk,aligned],env);
+ run(j('java'),['-jar',path.join(bt,'lib/apksigner.jar'),'verify','--verbose',apk]);return jar;
+}
+const mainJar=compile('executor',path.join(root,'app/src/main/AndroidManifest.xml'),path.join(root,'app/src/main/java'),path.join(root,'app/src/main/res'));
+if(fs.existsSync(path.join(root,'test/AndroidManifest.xml')))compile('executor-tests',path.join(root,'test/AndroidManifest.xml'),path.join(root,'test/java'),null,[mainJar]);
+const cert=path.join(build,'signer.der');run(j('keytool'),['-exportcert','-keystore',ks,'-alias','executor','-storepass:env','POCKET_KEY_PASSWORD','-file',cert],env);
+const certBytes=fs.readFileSync(cert);const info={appName:'随手待办测试器',packageName:'com.personalai.pocketexecutor',signatureMD5:crypto.createHash('md5').update(certBytes).digest('hex'),signatureSHA256:crypto.createHash('sha256').update(certBytes).digest('hex'),sdkVersion:'6.8.40',version:'0.1.0'};
+fs.writeFileSync(path.join(out,'registration-info.json'),JSON.stringify(info,null,2)+'\n');
+fs.writeFileSync(path.join(out,'registration-info.md'),`# 微信开放平台移动应用登记信息\n\n应用名称：${info.appName}\n\nAndroid 包名：\`${info.packageName}\`\n\n应用签名 MD5（32位，无冒号）：\`${info.signatureMD5}\`\n\nSHA-256：\`${info.signatureSHA256}\`\n\n本地测试签名保存在源码目录 .signing/，不在分发包中。以后更新 APK 必须保留此签名；改变签名需要修改开放平台登记。\n`);
+console.log(JSON.stringify({apk:path.join(out,'executor.apk'),...info},null,2));

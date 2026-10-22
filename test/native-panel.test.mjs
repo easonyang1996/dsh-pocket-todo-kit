@@ -1,0 +1,25 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import { descriptors } from '../lib/contracts.mjs';
+const code = fs.readFileSync(new URL('../lib/client.js',import.meta.url),'utf8');
+test('native UI mounts via DSH slots/RPC, opens launch payload, and keeps missing targets unresolved',async()=>{
+ let plugin,finish,mounted;const slots=new Map(),calls=[],values=[];
+ const state={todos:[{id:'t',title:'打开微信',targetName:'微信',kind:'android_app',status:'pending',evidence:'打开微信',sourceType:'text',createdAt:new Date().toISOString(),source:{sessionId:'s'},resolution:{status:'configured',candidates:[]},launch:{kind:'android_app',packageName:'com.tencent.mm'}}],targets:[],android:{environment:{adbAvailable:true,labelsAvailable:true,adbPath:'/test/adb',aaptPath:'/test/aapt2'},devices:[],checkedAt:'2026-10-22T00:00:00Z',error:'',job:null}};
+ let cursor=0;
+ const react={createElement:(type,props,...children)=>({type,props:props||{},children:children.flat()}),useSyncExternalStore(){},useState(init){const i=cursor++;if(!(i in values))values[i]=init;return[values[i],v=>{values[i]=typeof v==='function'?v(values[i]):v;}];}};
+ vm.runInNewContext(code,{window:{__ModuleLoader__:{load({factory}){plugin=factory(id=>id==='react'?react:{RemoteStreamCarrierError:Error});}}},console,crypto:{randomUUID:()=> 'id'},navigator:{clipboard:{writeText:async()=>{}}}});
+ const ctx={remote:{$mount:async v=>{mounted=v;return()=>{};},pocketTodo:{dispatch:async req=>{calls.push(req);return{ok:true,value:req.action==='launch'?{title:'打开微信',targetName:'微信',launch:state.todos[0].launch}:req.action==='android-status'?state.android:state};}},$stream:()=>({async *[Symbol.asyncIterator](){yield{value:state,accept(){}};await new Promise(r=>{finish=r;});},async dispose(){finish?.();}})},async inject(_deps,fn){return{dispose:await fn(this)};},slots:{inject(_name,fn){fn();},register(meta,fn){slots.set(meta.name,fn);return()=>{};}},uiWorkspace:{openSession(){}},layout:{}};
+ const stop=await plugin.apply(ctx);await Promise.resolve();assert.equal(mounted.package,'dsh-pocket-todo');assert.equal(mounted.descriptors.length,descriptors.length);
+ assert.equal(mounted.descriptors[0].parameters[0].codec.create().safeParse({action:'arbitrary-shell'}).success,false);
+ const render=()=>{cursor=0;return slots.get('main')();};
+ const find=(node,p)=>{if(!node||typeof node!=='object')return; if(p(node))return node;for(const c of node.children||[]){const f=find(c,p);if(f)return f;}};
+ const button=find(render(),n=>n.type==='button'&&n.children.includes('前往'));assert(button);await button.props.onClick();
+ assert.equal(calls.at(-1).action,'launch');const tree=render();assert(find(tree,n=>n.props.role==='dialog'));
+ assert(find(tree,n=>n.type==='pre'&&n.children.some(c=>typeof c==='string'&&c.includes('com.tencent.mm'))));
+ assert(slots.has('sidebar.panellist'));assert.doesNotMatch(code,/createElement\(['"]iframe|control-token|http:\/\/127\.0\.0\.1/);const close=find(render(),n=>n.type==='button'&&n.children.includes('关闭'));await close.props.onClick();
+ const scanButton=find(render(),n=>n.type==='button'&&n.children.includes('扫描手机 App'));assert(scanButton);await scanButton.props.onClick();assert.equal(calls.at(-1).action,'android-status');
+ const scanTree=render();assert(find(scanTree,n=>n.props['aria-label']==='扫描 Android 手机 App'));const start=find(scanTree,n=>n.type==='button'&&n.children.includes('开始扫描并导入'));assert.equal(start.props.disabled,true);
+ await stop();
+});
